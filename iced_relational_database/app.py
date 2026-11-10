@@ -112,8 +112,9 @@ def filtered_documents(
         """,
         tuple(params),
     )
-    topic_names = load_topics()[["topic_id", "topic_name"]]
-    return documents.merge(topic_names, on="topic_id", how="left")
+    topic_names = load_topics().set_index("topic_id")["topic_name"]
+    documents["topic_name"] = documents["topic_id"].map(topic_names)
+    return documents
 
 
 def topic_distribution(documents: pd.DataFrame) -> pd.DataFrame:
