@@ -800,18 +800,22 @@ def render_personalized_visualization(documents: pd.DataFrame) -> None:
             title=f"Document count — {y_label} × {x_label}",
         )
     else:
+        group_columns = [x_column]
+        if x_column != "topic_name":
+            group_columns.append("topic_name")
         aggregation = (
-            data.groupby([x_column, "topic_name"], dropna=False)["document_id"]
+            data.groupby(group_columns, dropna=False)["document_id"]
             .nunique()
             .reset_index(name="documents")
             .dropna(subset=[x_column])
         )
+        color_column = "topic_name" if x_column != "topic_name" else None
         if chart_type == "Bar":
             figure = px.bar(
                 aggregation,
                 x=x_column,
                 y="documents",
-                color="topic_name",
+                color=color_column,
                 barmode="group",
                 labels={
                     x_column: x_label,
@@ -825,7 +829,7 @@ def render_personalized_visualization(documents: pd.DataFrame) -> None:
                 aggregation,
                 x=x_column,
                 y="documents",
-                color="topic_name",
+                color=color_column,
                 markers=True,
                 labels={
                     x_column: x_label,
