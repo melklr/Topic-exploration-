@@ -3,12 +3,15 @@ from __future__ import annotations
 import sqlite3
 import re
 from collections import Counter
+from itertools import combinations
 from math import cos, pi, sin
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 import streamlit as st
 
 
@@ -104,7 +107,8 @@ def filtered_documents(
         f"""
         SELECT DISTINCT dv.document_id, dv.source_code, dv.publication_year,
                dv.predicted_trl, dv.trl_label, dv.trl_similarity,
-               dv.topic_id, dv.topic_label, dv.topic_score, d.title, d.keywords
+               dv.topic_id, dv.topic_label, dv.topic_score, d.title, d.keywords,
+               COALESCE(d.pretreated_text, d.abstract, d.title, '') AS document_text
         FROM document_visualization dv
         JOIN documents d ON d.document_id = dv.document_id
         WHERE {where}
@@ -328,7 +332,45 @@ def render_relationships(topic_ids: list[int], key_prefix: str = "relationships"
         )
 
 
-def render_graph_section(topic_ids: list[int]) -> None:
+def build_semantic_edges(
+    documents: pd.DataFrame, topic_ids: list[int]
+) -> pd.DataFrame:
+    """Build topic edges from cosine similarity between TF-IDF topic centroids."""
+    corpus = (
+        documents[documents["topic_id"].isin(topic_ids)]
+        .drop_duplicates(["topic_id", "document_id"])
+        .assign(document_text=lambda frame: frame["document_text"].fillna(""))
+        .groupby(["topic_id", "topic_name"], as_index=False)["document_text"]
+        .agg(" ".join)
+    )
+    corpus = corpus[corpus["document_text"].str.strip().ne("")]
+    if len(corpus) < 2:
+        return pd.DataFrame(
+            columns=["topic_a_name", "topic_b_name", "cosine_similarity"]
+        )
+
+    vectorizer = TfidfVectorizer(
+        stop_words="english",
+        ngram_range=(1, 2),
+        min_df=1,
+        max_df=0.95,
+        sublinear_tf=True,
+    )
+    matrix = vectorizer.fit_transform(corpus["document_text"])
+    similarities = cosine_similarity(matrix)
+    rows = []
+    for left, right in combinations(range(len(corpus)), 2):
+        rows.append(
+            {
+                "topic_a_name": corpus.iloc[left]["topic_name"],
+                "topic_b_name": corpus.iloc[right]["topic_name"],
+                "cosine_similarity": float(similarities[left, right]),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("cosine_similarity", ascending=False)
+
+
+def render_graph_section(documents: pd.DataFrame, topic_ids: list[int]) -> None:
     st.subheader("Relational and semantic graphs")
     if len(topic_ids) < 2:
         st.info("Select at least two topics in the sidebar to display graphs.")
@@ -440,37 +482,46 @@ def render_graph_section(topic_ids: list[int]) -> None:
             )
 
     with graph_tab_semantic:
-        semantic = relations[
-            relations["fisher_q_bh"].notna()
-            & (relations["fisher_q_bh"] <= 0.05)
-            & relations["lift"].notna()
-            & (relations["lift"] > 1)
+        semantic_all = build_semantic_edges(documents, topic_ids)
+        threshold = st.slider(
+            "Minimum cosine similarity",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.15,
+            step=0.01,
+            key="semantic_cosine_threshold",
+        )
+        semantic = semantic_all[
+            semantic_all["cosine_similarity"] >= threshold
         ].copy()
         st.caption(
-            "Edges retain statistically supported topic associations with lift > 1 "
-            "and Benjamini–Hochberg corrected q ≤ 0.05."
+            "Each topic is represented by the TF-IDF centroid of its filtered "
+            "document texts. Edges show cosine similarity between topic centroids; "
+            "they are not based on co-occurrence statistics."
         )
         st.dataframe(
             semantic[
                 [
                     "topic_a_name",
                     "topic_b_name",
-                    "lift",
-                    "phi",
-                    "fisher_q_bh",
+                    "cosine_similarity",
                 ]
-            ].sort_values("lift", ascending=False),
+            ].sort_values("cosine_similarity", ascending=False),
             use_container_width=True,
             hide_index=True,
         )
         if not semantic.empty:
             st.plotly_chart(
-                graph_figure(semantic, "lift", "Semantic graph — topic associations"),
+                graph_figure(
+                    semantic,
+                    "cosine_similarity",
+                    "Semantic graph — TF-IDF cosine similarity",
+                ),
                 use_container_width=True,
                 key="graph_semantic_associations",
             )
         else:
-            st.info("No statistically supported semantic edges match the selected topics.")
+            st.info("No semantic edges meet the selected cosine-similarity threshold.")
 
 
 def render_integrated_view(documents: pd.DataFrame) -> None:
@@ -926,7 +977,9 @@ with tab_dashboard:
 with tab_relationships:
     render_relationships(selected_topic_ids or topics["topic_id"].tolist())
 with tab_graphs:
-    render_graph_section(selected_topic_ids or topics["topic_id"].tolist())
+    render_graph_section(
+        documents, selected_topic_ids or topics["topic_id"].tolist()
+    )
 with tab_explorer:
     render_topic_explorer(documents)
 with tab_integrated:
