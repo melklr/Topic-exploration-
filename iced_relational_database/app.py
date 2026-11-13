@@ -834,8 +834,10 @@ def render_personalized_visualization(documents: pd.DataFrame) -> None:
         st.info("No documents match the current filters.")
         return
 
-    topic_options = documents[["topic_id", "topic_name"]].drop_duplicates().sort_values(
-        "topic_name"
+    topic_options = (
+        documents[["topic_id", "topic_name"]]
+        .drop_duplicates()
+        .sort_values("topic_id")
     )
     default_topic_ids = topic_options["topic_id"].tolist()[:2]
     topic_documents = {
@@ -997,14 +999,21 @@ def render_personalized_visualization(documents: pd.DataFrame) -> None:
         .set_index("topic_id")["topic_name"]
         .to_dict()
     )
-    shared_documents = data[
-        data["topic_id"].isin(selected_ids)
-    ].copy()
-    shared_counts = shared_documents.groupby("document_id")["topic_id"].nunique()
-    shared_ids = shared_counts[shared_counts.eq(len(selected_ids))].index
+    shared_documents = data[data["topic_id"].isin(selected_ids)].copy()
+    topic_document_sets = {
+        topic_id: set(
+            shared_documents.loc[
+                shared_documents["topic_id"].eq(topic_id), "document_id"
+            ]
+        )
+        for topic_id in selected_ids
+    }
+    shared_ids = set.intersection(
+        *(topic_document_sets[topic_id] for topic_id in selected_ids)
+    )
     shared_documents = shared_documents[
         shared_documents["document_id"].isin(shared_ids)
-    ].copy()
+    ].drop_duplicates(["document_id", "topic_id"])
     if shared_documents.empty:
         st.info("No documents are assigned to all selected topics.")
         return
