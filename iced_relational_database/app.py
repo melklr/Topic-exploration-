@@ -42,7 +42,7 @@ def read_query(query: str, params: tuple = ()) -> pd.DataFrame:
 @st.cache_data
 def load_topics() -> pd.DataFrame:
     result = read_query(
-        "SELECT topic_id, topic_label FROM topics WHERE is_outlier = 0 ORDER BY topic_label"
+        "SELECT topic_id, topic_label FROM topics WHERE is_outlier = 0 ORDER BY topic_id"
     )
     result["topic_name"] = result.apply(
         lambda row: format_topic_name(row["topic_label"], row["topic_id"]),
@@ -58,7 +58,7 @@ def format_topic_name(value: object, topic_id: object = None) -> str:
     stopwords = {"topic", "none", "nan", "and", "the", "of", "for", "with"}
     terms = list(dict.fromkeys(term for term in terms if term not in stopwords))
     keywords = " · ".join(terms[:4]) if terms else "unlabelled"
-    stable_id = f"T{int(topic_id):02d}" if pd.notna(topic_id) else "T?"
+    stable_id = f"T{int(topic_id) + 1:02d}" if pd.notna(topic_id) else "T?"
     return f"{stable_id} — {keywords}"
 
 
@@ -968,6 +968,78 @@ def render_personalized_visualization(documents: pd.DataFrame) -> None:
 
     figure.update_layout(legend_title_text="Topic", height=650)
     st.plotly_chart(figure, use_container_width=True, key="personalized_visualization")
+
+    st.markdown("#### Shared-document topic-score heatmap")
+    st.caption(
+        "Rows are documents assigned to every selected topic; cells show the topic "
+        "score. Documents are sorted in ascending order by the selected topic score."
+    )
+    if len(selected_ids) < 2:
+        st.info("Select at least two topics to display shared documents.")
+        return
+
+    selected_topic_names = (
+        topic_options[topic_options["topic_id"].isin(selected_ids)]
+        .set_index("topic_id")["topic_name"]
+        .to_dict()
+    )
+    shared_documents = data[
+        data["topic_id"].isin(selected_ids)
+    ].copy()
+    shared_counts = shared_documents.groupby("document_id")["topic_id"].nunique()
+    shared_ids = shared_counts[shared_counts.eq(len(selected_ids))].index
+    shared_documents = shared_documents[
+        shared_documents["document_id"].isin(shared_ids)
+    ].copy()
+    if shared_documents.empty:
+        st.info("No documents are assigned to all selected topics.")
+        return
+
+    sort_topic_id = st.selectbox(
+        "Sort shared documents by topic score",
+        selected_ids,
+        format_func=lambda value: selected_topic_names[value],
+        key="personalized_heatmap_sort_topic",
+    )
+    score_matrix = shared_documents.pivot_table(
+        index="document_id",
+        columns="topic_id",
+        values="topic_score",
+        aggfunc="max",
+    ).reindex(columns=selected_ids)
+    sort_values = score_matrix[sort_topic_id].fillna(float("inf"))
+    score_matrix = score_matrix.loc[sort_values.sort_values(ascending=True).index]
+    score_matrix.columns = [
+        selected_topic_names[topic_id] for topic_id in score_matrix.columns
+    ]
+    document_labels = (
+        shared_documents[["document_id", "display_title"]]
+        .drop_duplicates("document_id")
+        .set_index("document_id")
+        .reindex(score_matrix.index)["display_title"]
+        .fillna("Untitled document")
+        .map(lambda title: str(title)[:90])
+    )
+    score_matrix.index = [
+        f"{document_id} — {document_labels.loc[document_id]}"
+        for document_id in score_matrix.index
+    ]
+    st.plotly_chart(
+        px.imshow(
+            score_matrix,
+            text_auto=".2f",
+            aspect="auto",
+            color_continuous_scale="Cividis",
+            labels={
+                "x": "Topic",
+                "y": "Document",
+                "color": "Topic score",
+            },
+            title=f"Shared documents sorted by {selected_topic_names[sort_topic_id]} score",
+        ),
+        use_container_width=True,
+        key="personalized_shared_document_topic_scores",
+    )
 
 
 def render_landscape_views(documents: pd.DataFrame) -> None:
