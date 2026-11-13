@@ -11,6 +11,7 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import networkx as nx
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import streamlit as st
@@ -43,22 +44,22 @@ def load_topics() -> pd.DataFrame:
     result = read_query(
         "SELECT topic_id, topic_label FROM topics WHERE is_outlier = 0 ORDER BY topic_label"
     )
-    result["topic_name"] = result["topic_label"].map(format_topic_name)
+    result["topic_name"] = result.apply(
+        lambda row: format_topic_name(row["topic_label"], row["topic_id"]),
+        axis=1,
+    )
     return result
 
 
-def format_topic_name(value: object) -> str:
-    """Remove only the generated numeric prefix from a topic label."""
-    label = (
-        str(value)
-        .replace("Topic ", "")
-        .removeprefix("T")
-        .removeprefix("_")
-        .split("_", 1)[-1]
-        .replace("_", " ")
-        .strip()
-    )
-    return label[:1].upper() + label[1:] if label else "Unnamed topic"
+def format_topic_name(value: object, topic_id: object = None) -> str:
+    """Create a stable, traceable label from the representative topic terms."""
+    raw = re.sub(r"^(?:Topic\s*)?T?\d+[_\s]*", "", str(value), flags=re.IGNORECASE)
+    terms = [term.replace("-", " ").strip().lower() for term in re.split(r"[_\s]+", raw) if term.strip()]
+    stopwords = {"topic", "none", "nan", "and", "the", "of", "for", "with"}
+    terms = list(dict.fromkeys(term for term in terms if term not in stopwords))
+    keywords = " · ".join(terms[:4]) if terms else "unlabelled"
+    stable_id = f"T{int(topic_id):02d}" if pd.notna(topic_id) else "T?"
+    return f"{stable_id} — {keywords}"
 
 
 def choose_document_title(
@@ -330,8 +331,12 @@ def render_relationships(topic_ids: list[int], key_prefix: str = "relationships"
         """,
         tuple(topic_ids + topic_ids),
     )
-    relations["topic_a_name"] = relations["topic_a_label"].map(format_topic_name)
-    relations["topic_b_name"] = relations["topic_b_label"].map(format_topic_name)
+    relations["topic_a_name"] = relations.apply(
+        lambda row: format_topic_name(row["topic_a_label"], row["topic_a"]), axis=1
+    )
+    relations["topic_b_name"] = relations.apply(
+        lambda row: format_topic_name(row["topic_b_label"], row["topic_b"]), axis=1
+    )
     st.dataframe(
         relations[["topic_a_name", "topic_b_name", "shared_documents"]].rename(
             columns={
@@ -417,21 +422,25 @@ def render_graph_section(documents: pd.DataFrame, topic_ids: list[int]) -> None:
         """,
         tuple(topic_ids + topic_ids),
     )
-    relations["topic_a_name"] = relations["topic_a_label"].map(format_topic_name)
-    relations["topic_b_name"] = relations["topic_b_label"].map(format_topic_name)
+    relations["topic_a_name"] = relations.apply(
+        lambda row: format_topic_name(row["topic_a_label"], row["topic_a"]), axis=1
+    )
+    relations["topic_b_name"] = relations.apply(
+        lambda row: format_topic_name(row["topic_b_label"], row["topic_b"]), axis=1
+    )
     graph_tab_relational, graph_tab_semantic = st.tabs(
         ["Relational graph", "Semantic graph"]
     )
 
     def graph_figure(edges: pd.DataFrame, weight_column: str, title: str) -> go.Figure:
         labels = pd.unique(edges[["topic_a_name", "topic_b_name"]].values.ravel("K")).tolist()
-        positions = {
-            label: (
-                cos(2 * pi * i / len(labels)),
-                sin(2 * pi * i / len(labels)),
-            )
-            for i, label in enumerate(labels)
-        }
+        graph = nx.Graph()
+        graph.add_nodes_from(labels)
+        graph.add_edges_from(
+            (row.topic_a_name, row.topic_b_name)
+            for row in edges.itertuples(index=False)
+        )
+        positions = nx.spring_layout(graph, seed=42, weight=None)
         edge_x: list[float] = []
         edge_y: list[float] = []
         for row in edges.itertuples(index=False):
@@ -482,6 +491,15 @@ def render_graph_section(documents: pd.DataFrame, topic_ids: list[int]) -> None:
             yaxis=dict(visible=False),
             margin=dict(l=10, r=10, t=55, b=10),
         )
+        figure.add_annotation(
+            text="Node size = weighted degree · edge width = association strength",
+            x=0,
+            y=-0.08,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            font=dict(size=11, color="#555555"),
+        )
         return figure
 
     with graph_tab_relational:
@@ -524,9 +542,38 @@ def render_graph_section(documents: pd.DataFrame, topic_ids: list[int]) -> None:
             step=0.01,
             key="semantic_cosine_threshold",
         )
-        semantic = semantic_all[
-            semantic_all["cosine_similarity"] >= threshold
+        top_k = st.slider(
+            "Maximum semantic neighbours per topic",
+            min_value=1,
+            max_value=max(len(topic_ids) - 1, 1),
+            value=min(3, max(len(topic_ids) - 1, 1)),
+            key="semantic_top_k",
+        )
+        candidate_edges = pd.concat(
+            [
+                semantic_all.assign(
+                    source_topic=semantic_all["topic_a_name"],
+                    neighbour=semantic_all["topic_b_name"],
+                ),
+                semantic_all.assign(
+                    source_topic=semantic_all["topic_b_name"],
+                    neighbour=semantic_all["topic_a_name"],
+                ),
+            ],
+            ignore_index=True,
+        )
+        candidate_edges = candidate_edges.sort_values(
+            ["source_topic", "cosine_similarity"], ascending=[True, False]
+        )
+        candidate_edges = candidate_edges.groupby("source_topic", as_index=False).head(top_k)
+        semantic = candidate_edges[
+            candidate_edges["cosine_similarity"] >= threshold
         ].copy()
+        semantic["edge_key"] = semantic.apply(
+            lambda row: tuple(sorted((row["topic_a_name"], row["topic_b_name"]))),
+            axis=1,
+        )
+        semantic = semantic.drop_duplicates("edge_key").drop(columns="edge_key")
         st.caption("Nodes are topics; edges connect topics whose TF-IDF text centroids exceed the selected cosine-similarity threshold. The table is sorted by similarity.")
         st.dataframe(
             semantic[
