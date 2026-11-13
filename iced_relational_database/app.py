@@ -837,10 +837,24 @@ def render_personalized_visualization(documents: pd.DataFrame) -> None:
     topic_options = documents[["topic_id", "topic_name"]].drop_duplicates().sort_values(
         "topic_name"
     )
+    default_topic_ids = topic_options["topic_id"].tolist()[:2]
+    topic_documents = {
+        topic_id: set(
+            documents.loc[documents["topic_id"].eq(topic_id), "document_id"]
+        )
+        for topic_id in topic_options["topic_id"]
+    }
+    best_pair = max(
+        combinations(topic_options["topic_id"].tolist(), 2),
+        key=lambda pair: len(topic_documents[pair[0]] & topic_documents[pair[1]]),
+        default=None,
+    )
+    if best_pair and len(topic_documents[best_pair[0]] & topic_documents[best_pair[1]]) > 0:
+        default_topic_ids = list(best_pair)
     selected_ids = st.multiselect(
         "Topics to display",
         topic_options["topic_id"].tolist(),
-        default=topic_options["topic_id"].tolist(),
+        default=default_topic_ids,
         format_func=lambda value: topic_options.loc[
             topic_options.topic_id.eq(value), "topic_name"
         ].iloc[0],
@@ -969,7 +983,7 @@ def render_personalized_visualization(documents: pd.DataFrame) -> None:
     figure.update_layout(legend_title_text="Topic", height=650)
     st.plotly_chart(figure, use_container_width=True, key="personalized_visualization")
 
-    st.markdown("#### Shared-document topic-score heatmap")
+    st.markdown("#### Shared-document topic-score heatmap", help="Select at least two topics above.")
     st.caption(
         "Rows are documents assigned to every selected topic; cells show the topic "
         "score. Documents are sorted in ascending order by the selected topic score."
