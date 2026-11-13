@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import re
+import json
 from collections import Counter
 from itertools import combinations
 from math import cos, pi, sin
@@ -47,8 +48,8 @@ def load_topics() -> pd.DataFrame:
 
 
 def format_topic_name(value: object) -> str:
-    """Return a readable topic label while retaining the database identifier separately."""
-    return (
+    """Remove only the generated numeric prefix from a topic label."""
+    label = (
         str(value)
         .replace("Topic ", "")
         .removeprefix("T")
@@ -56,8 +57,27 @@ def format_topic_name(value: object) -> str:
         .split("_", 1)[-1]
         .replace("_", " ")
         .strip()
-        .title()
     )
+    return label[:1].upper() + label[1:] if label else "Unnamed topic"
+
+
+def choose_document_title(
+    title_clean: object, metadata: object, fallback_title: object
+) -> str:
+    """Prefer a cleaned title, then metadata title fields, then the legacy title."""
+    if isinstance(title_clean, str) and title_clean.strip():
+        return title_clean.strip()
+    if isinstance(metadata, str):
+        try:
+            metadata_value = json.loads(metadata)
+        except json.JSONDecodeError:
+            metadata_value = {}
+        if isinstance(metadata_value, dict):
+            for key in ("title_clean", "title", "document_title"):
+                value = metadata_value.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return str(fallback_title or "Untitled document").strip()
 
 
 @st.cache_data
@@ -107,7 +127,8 @@ def filtered_documents(
         f"""
         SELECT DISTINCT dv.document_id, dv.source_code, dv.publication_year,
                dv.predicted_trl, dv.trl_label, dv.trl_similarity,
-               dv.topic_id, dv.topic_label, dv.topic_score, d.title, d.keywords,
+               dv.topic_id, dv.topic_label, dv.topic_score, d.title,
+               d.title_clean, d.metadata, d.keywords,
                COALESCE(d.pretreated_text, d.abstract, d.title, '') AS document_text
         FROM document_visualization dv
         JOIN documents d ON d.document_id = dv.document_id
@@ -118,6 +139,12 @@ def filtered_documents(
     )
     topic_names = load_topics().set_index("topic_id")["topic_name"]
     documents["topic_name"] = documents["topic_id"].map(topic_names)
+    documents["display_title"] = documents.apply(
+        lambda row: choose_document_title(
+            row["title_clean"], row["metadata"], row["title"]
+        ),
+        axis=1,
+    )
     return documents
 
 
@@ -144,6 +171,7 @@ def render_topic_explorer(documents: pd.DataFrame) -> None:
         format_func=lambda value: topics.loc[topics.topic_id.eq(value), "topic_name"].iloc[0],
     )
     selected_documents = documents[documents["topic_id"].eq(selected)].copy()
+    st.caption("Cleaned titles are shown when available; click a column header to sort the table.")
     st.dataframe(
         selected_documents[
             [
@@ -152,7 +180,7 @@ def render_topic_explorer(documents: pd.DataFrame) -> None:
                 "publication_year",
                 "predicted_trl",
                 "trl_similarity",
-                "title",
+                "display_title",
             ]
         ],
         use_container_width=True,
@@ -277,7 +305,7 @@ def render_dashboard(documents: pd.DataFrame, topic_view: str) -> None:
                 text_auto=True,
                 aspect="auto",
                 labels={"x": "Estimated TRL", "y": "Topic", "color": "Documents"},
-                color_continuous_scale="Viridis",
+                color_continuous_scale="Cividis",
             ),
             use_container_width=True,
             key="dashboard_topic_maturity",
@@ -317,7 +345,7 @@ def render_relationships(topic_ids: list[int], key_prefix: str = "relationships"
     )
     matrix = relations.pivot(
         index="topic_a_name", columns="topic_b_name", values="shared_documents"
-    ).fillna(0)
+    ).replace(0, float("nan"))
     if not matrix.empty:
         st.plotly_chart(
             px.imshow(
@@ -325,7 +353,7 @@ def render_relationships(topic_ids: list[int], key_prefix: str = "relationships"
                 text_auto=True,
                 aspect="auto",
                 labels={"x": "Topic B", "y": "Topic A", "color": "Shared documents"},
-                color_continuous_scale="Blues",
+                color_continuous_scale="Cividis",
             ),
             use_container_width=True,
             key=f"{key_prefix}_shared_documents_matrix",
@@ -391,10 +419,6 @@ def render_graph_section(documents: pd.DataFrame, topic_ids: list[int]) -> None:
     )
     relations["topic_a_name"] = relations["topic_a_label"].map(format_topic_name)
     relations["topic_b_name"] = relations["topic_b_label"].map(format_topic_name)
-    if relations.empty:
-        st.info("No stored relationships match the selected topics.")
-        return
-
     graph_tab_relational, graph_tab_semantic = st.tabs(
         ["Relational graph", "Semantic graph"]
     )
@@ -421,7 +445,7 @@ def render_graph_section(documents: pd.DataFrame, topic_ids: list[int]) -> None:
                 x=edge_x,
                 y=edge_y,
                 mode="lines",
-                line=dict(width=1, color="#AAB2B9"),
+                line=dict(width=1.5, color="#7F7F7F"),
                 hoverinfo="skip",
                 name="Topic association",
             )
@@ -444,7 +468,7 @@ def render_graph_section(documents: pd.DataFrame, topic_ids: list[int]) -> None:
                 hovertemplate="Topic: %{customdata[0]}<br>Weighted degree: %{customdata[1]}<extra></extra>",
                 marker=dict(
                     size=[22 + 8 * degree[label] / max(degree.values(), default=1) for label in labels],
-                    color="#2E86AB",
+                    color="#0072B2",
                     line=dict(width=1, color="white"),
                 ),
                 name="Topic",
@@ -462,7 +486,16 @@ def render_graph_section(documents: pd.DataFrame, topic_ids: list[int]) -> None:
 
     with graph_tab_relational:
         relational = relations[relations["shared_documents"] > 0].copy()
-        st.caption("Edges represent the number of documents in which two topics co-occur.")
+        st.caption("Nodes are topics; edges count documents assigned to both topics. The table is sorted by shared-document count.")
+        max_edges = max(len(relational), 1)
+        edge_limit = st.slider(
+            "Maximum relational edges",
+            min_value=1,
+            max_value=max_edges,
+            value=min(25, max_edges),
+            key="relational_edge_limit",
+        )
+        relational = relational.sort_values("shared_documents", ascending=False).head(edge_limit)
         st.dataframe(
             relational[
                 ["topic_a_name", "topic_b_name", "shared_documents"]
@@ -494,11 +527,7 @@ def render_graph_section(documents: pd.DataFrame, topic_ids: list[int]) -> None:
         semantic = semantic_all[
             semantic_all["cosine_similarity"] >= threshold
         ].copy()
-        st.caption(
-            "Each topic is represented by the TF-IDF centroid of its filtered "
-            "document texts. Edges show cosine similarity between topic centroids; "
-            "they are not based on co-occurrence statistics."
-        )
+        st.caption("Nodes are topics; edges connect topics whose TF-IDF text centroids exceed the selected cosine-similarity threshold. The table is sorted by similarity.")
         st.dataframe(
             semantic[
                 [
@@ -894,6 +923,305 @@ def render_personalized_visualization(documents: pd.DataFrame) -> None:
     st.plotly_chart(figure, use_container_width=True, key="personalized_visualization")
 
 
+def render_landscape_views(documents: pd.DataFrame) -> None:
+    st.subheader("Technology landscape and documentary sources")
+    st.caption("Counts refer to distinct documents; topic assignments are multi-label, so one document may contribute to several topics.")
+    distribution = topic_distribution(documents)
+    if distribution.empty:
+        st.info("No documents match the current filters.")
+        return
+
+    st.markdown("#### Topic prevalence")
+    st.plotly_chart(
+        px.bar(
+            distribution.sort_values("documents"),
+            x="documents",
+            y="topic_label",
+            orientation="h",
+            labels={"documents": "Distinct documents", "topic_label": "Topic"},
+        ),
+        use_container_width=True,
+        key="landscape_topic_prevalence",
+    )
+
+    source = (
+        documents.groupby(["topic_name", "source_code"], as_index=False)["document_id"]
+        .nunique()
+        .rename(columns={"topic_name": "topic", "document_id": "documents"})
+    )
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### Topic × source counts")
+        heat = source.pivot(index="topic", columns="source_code", values="documents").fillna(0)
+        st.plotly_chart(
+            px.imshow(
+                heat,
+                text_auto=True,
+                aspect="auto",
+                labels={"x": "Source", "y": "Topic", "color": "Distinct documents"},
+                color_continuous_scale="Blues",
+            ),
+            use_container_width=True,
+            key="landscape_topic_source",
+        )
+    with right:
+        st.markdown("#### Relative source composition")
+        composition = source.copy()
+        composition["share"] = composition["documents"] / composition.groupby("topic")["documents"].transform("sum")
+        st.plotly_chart(
+            px.bar(
+                composition,
+                x="topic",
+                y="share",
+                color="source_code",
+                barmode="stack",
+                labels={"topic": "Topic", "share": "Share of topic documents", "source_code": "Source"},
+            ).update_layout(yaxis_tickformat=".0%", xaxis_tickangle=-45),
+            use_container_width=True,
+            key="landscape_source_composition",
+        )
+
+
+def render_temporal_views(documents: pd.DataFrame) -> None:
+    st.subheader("Temporal evolution and emergence")
+    st.caption("Temporal counts are distinct documents per year and topic; lines are ordered chronologically.")
+    temporal = (
+        documents.dropna(subset=["publication_year"])
+        .groupby(["publication_year", "topic_name"], as_index=False)["document_id"]
+        .nunique()
+        .rename(columns={"document_id": "documents", "topic_name": "topic"})
+    )
+    if temporal.empty:
+        st.info("No publication years are available.")
+        return
+
+    st.markdown("#### Topic trajectories")
+    st.plotly_chart(
+        px.line(
+            temporal,
+            x="publication_year",
+            y="documents",
+            color="topic",
+            markers=True,
+            labels={"publication_year": "Year", "documents": "Distinct documents", "topic": "Topic"},
+        ),
+        use_container_width=True,
+        key="temporal_topic_trajectories",
+    )
+
+    source_year = (
+        documents.dropna(subset=["publication_year"])
+        .groupby(["publication_year", "source_code"], as_index=False)["document_id"]
+        .nunique()
+        .rename(columns={"document_id": "documents"})
+    )
+    st.markdown("#### Documentary activity by source")
+    st.plotly_chart(
+        px.area(
+            source_year,
+            x="publication_year",
+            y="documents",
+            color="source_code",
+            labels={"publication_year": "Year", "documents": "Distinct documents", "source_code": "Source"},
+        ),
+        use_container_width=True,
+        key="temporal_source_activity",
+    )
+
+    recent_years = sorted(temporal["publication_year"].unique())[-3:]
+    previous_years = sorted(temporal["publication_year"].unique())[:-3]
+    if previous_years and recent_years:
+        recent = temporal[temporal["publication_year"].isin(recent_years)].groupby("topic")["documents"].sum()
+        previous = temporal[temporal["publication_year"].isin(previous_years)].groupby("topic")["documents"].sum()
+        emergence = pd.DataFrame({"recent_documents": recent, "previous_documents": previous}).fillna(0)
+        emergence["recent_share"] = emergence["recent_documents"] / max(len(recent_years), 1)
+        emergence["previous_share"] = emergence["previous_documents"] / max(len(previous_years), 1)
+        emergence["growth"] = emergence["recent_share"] - emergence["previous_share"]
+        emergence = emergence.reset_index().sort_values("growth", ascending=False).head(15)
+        st.markdown("#### Recent activity signal")
+        st.caption("Activity signal = mean annual topic-document count in the last three years minus the mean annual count in all preceding years; exploratory, not a forecast.")
+        st.plotly_chart(
+            px.bar(
+                emergence.sort_values("growth"),
+                x="growth",
+                y="topic",
+                orientation="h",
+                color="growth",
+                color_continuous_scale="Cividis",
+                labels={"growth": "Change in average annual volume", "topic": "Topic"},
+            ),
+            use_container_width=True,
+            key="temporal_emergence_signal",
+        )
+
+
+def render_maturity_views(documents: pd.DataFrame) -> None:
+    st.subheader("Maturity and TRL profiles")
+    st.caption("TRL values are semantic evidence candidates, not verified maturity measurements.")
+    maturity = documents.dropna(subset=["predicted_trl"]).copy()
+    if maturity.empty:
+        st.info("No TRL observations are available.")
+        return
+    maturity["topic"] = maturity["topic_name"]
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### Estimated TRL distribution within each topic")
+        st.caption("Each box summarizes the median, interquartile range and outliers of document-level estimated TRL values for a topic.")
+        st.plotly_chart(
+            px.box(
+                maturity,
+                x="topic",
+                y="predicted_trl",
+                color="topic",
+                points="outliers",
+                labels={"topic": "Topic", "predicted_trl": "Estimated TRL"},
+            ).update_layout(showlegend=False, xaxis_tickangle=-45).update_traces(
+                marker_color="#0072B2"
+            ),
+            use_container_width=True,
+            key="maturity_topic_box",
+        )
+    with right:
+        st.markdown("#### Topic volume × estimated TRL")
+        st.caption("Each point is a topic: X = distinct documents, Y = mean estimated TRL across its documents, color = median estimated TRL.")
+        profile = maturity.groupby("topic", as_index=False).agg(
+            documents=("document_id", "nunique"),
+            mean_trl=("predicted_trl", "mean"),
+            median_trl=("predicted_trl", "median"),
+        )
+        st.plotly_chart(
+            px.scatter(
+                profile,
+                x="documents",
+                y="mean_trl",
+                size="documents",
+                color="median_trl",
+                hover_data=["topic", "median_trl"],
+                color_continuous_scale="Cividis",
+                labels={"documents": "Distinct documents", "mean_trl": "Mean estimated TRL", "median_trl": "Median estimated TRL"},
+            ),
+            use_container_width=True,
+            key="maturity_volume_mean_trl",
+        )
+
+    st.markdown("#### Topic × TRL profile")
+    st.caption("Each row sums to 100%; cells show the percentage of documents in a topic assigned to each estimated TRL.")
+    counts = maturity.groupby(["topic", "predicted_trl"], as_index=False)["document_id"].nunique()
+    counts = counts.rename(columns={"document_id": "documents"})
+    counts["share"] = counts["documents"] / counts.groupby("topic")["documents"].transform("sum")
+    matrix = counts.pivot(index="topic", columns="predicted_trl", values="share").fillna(0)
+    st.plotly_chart(
+        px.imshow(
+            matrix,
+            text_auto=".0%",
+            aspect="auto",
+            zmin=0,
+            zmax=1,
+            color_continuous_scale="Cividis",
+            labels={"x": "Estimated TRL", "y": "Topic", "color": "% of topic documents by TRL"},
+        ),
+        use_container_width=True,
+        key="maturity_normalized_heatmap",
+    )
+
+
+def render_quality_views(documents: pd.DataFrame) -> None:
+    st.subheader("Topic assignment quality and coverage")
+    st.caption("These views describe multi-label topic coverage and assignment structure, not model accuracy.")
+    if documents.empty:
+        st.info("No documents match the current filters.")
+        return
+
+    per_document = documents.groupby("document_id").agg(
+        topic_count=("topic_id", "nunique"),
+        strongest_score=("topic_score", "max"),
+    ).reset_index()
+    st.markdown("#### Number of topics assigned per document")
+    st.plotly_chart(
+        px.histogram(
+            per_document,
+            x="topic_count",
+            nbins=max(int(per_document["topic_count"].max()), 1),
+            labels={"topic_count": "Number of assigned topics", "count": "Documents"},
+        ),
+        use_container_width=True,
+        key="quality_topics_per_document",
+    )
+
+    matrix = documents.pivot_table(
+        index="document_id",
+        columns="topic_name",
+        values="topic_score",
+        aggfunc="max",
+        fill_value=0,
+    )
+    if not matrix.empty:
+        st.markdown("#### Document × topic assignment matrix")
+        st.plotly_chart(
+            px.imshow(
+                matrix,
+                aspect="auto",
+                color_continuous_scale="Blues",
+                labels={"x": "Topic", "y": "Document", "color": "Topic score"},
+            ),
+            use_container_width=True,
+            key="quality_document_topic_matrix",
+        )
+
+
+def render_text_views(documents: pd.DataFrame) -> None:
+    st.subheader("Text content and characteristic terms")
+    st.caption("Terms are ranked by TF-IDF within topic-level text aggregates; higher values indicate greater topic specificity.")
+    text = documents.dropna(subset=["document_text", "topic_name"]).copy()
+    text = text[text["document_text"].str.strip().ne("")]
+    if text.empty:
+        st.info("No text is available for the selected documents.")
+        return
+
+    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), min_df=1, max_df=0.95)
+    corpus = text.groupby("topic_name")["document_text"].agg(" ".join)
+    matrix = vectorizer.fit_transform(corpus)
+    terms = vectorizer.get_feature_names_out()
+    rows = []
+    for row_index, topic in enumerate(corpus.index):
+        scores = matrix[row_index].toarray().ravel()
+        for term_index in scores.argsort()[-8:][::-1]:
+            rows.append({"topic": topic, "term": terms[term_index], "tfidf": scores[term_index]})
+    terms_df = pd.DataFrame(rows)
+    st.markdown("#### Characteristic TF-IDF terms by topic")
+    st.plotly_chart(
+        px.bar(
+            terms_df.sort_values(["topic", "tfidf"]),
+            x="tfidf",
+            y="term",
+            color="topic",
+            facet_col="topic",
+            facet_col_wrap=3,
+            orientation="h",
+            labels={"tfidf": "Mean TF-IDF", "term": "Term", "topic": "Topic"},
+        ),
+        use_container_width=True,
+        key="text_characteristic_terms",
+    )
+
+    st.markdown("#### Topic–keyword network")
+    keyword_data = text[["topic_name", "keywords"]].dropna().copy()
+    keyword_data["keyword"] = keyword_data["keywords"].str.split(r"[;,|]")
+    keyword_data = keyword_data.explode("keyword")
+    keyword_data["keyword"] = keyword_data["keyword"].astype(str).str.strip().str.lower()
+    keyword_data = keyword_data[keyword_data["keyword"].ne("")]
+    top_keywords = keyword_data["keyword"].value_counts().head(25).index
+    keyword_data = keyword_data[keyword_data["keyword"].isin(top_keywords)]
+    network_counts = keyword_data.groupby(["topic_name", "keyword"], as_index=False).size()
+    st.dataframe(
+        network_counts.sort_values("size", ascending=False).rename(
+            columns={"topic_name": "Topic", "keyword": "Keyword", "size": "Documents"}
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
 def render_evidence(documents: pd.DataFrame) -> None:
     st.subheader("TRL evidence passages")
     if documents.empty:
@@ -959,35 +1287,39 @@ metric_a.metric("Documents", documents["document_id"].nunique())
 metric_b.metric("Topic observations", len(documents))
 metric_c.metric("Sources", documents["source_code"].nunique())
 
-tab_dashboard, tab_relationships, tab_graphs, tab_explorer, tab_integrated, tab_more, tab_legacy, tab_personalized, tab_evidence = st.tabs(
+tab_landscape, tab_temporal, tab_maturity, tab_relations, tab_documents, tab_quality, tab_text, tab_integrated, tab_personalized, tab_evidence = st.tabs(
     [
-        "D1 / D2 / D4",
-        "D3 Relationships",
-        "Relational graphs",
-        "Document explorer",
+        "Landscape & sources",
+        "Temporal evolution",
+        "Maturity & TRL",
+        "Relations & similarity",
+        "Documents",
+        "Topic quality",
+        "Text & keywords",
         "Integrated view",
-        "More visualizations",
-        "Historical plots",
-        "Personalized visualization",
+        "Personalized",
         "TRL evidence",
     ]
 )
-with tab_dashboard:
-    render_dashboard(documents, topic_view)
-with tab_relationships:
+with tab_landscape:
+    render_landscape_views(documents)
+with tab_temporal:
+    render_temporal_views(documents)
+with tab_maturity:
+    render_maturity_views(documents)
+with tab_relations:
     render_relationships(selected_topic_ids or topics["topic_id"].tolist())
-with tab_graphs:
     render_graph_section(
         documents, selected_topic_ids or topics["topic_id"].tolist()
     )
-with tab_explorer:
+with tab_documents:
     render_topic_explorer(documents)
+with tab_quality:
+    render_quality_views(documents)
+with tab_text:
+    render_text_views(documents)
 with tab_integrated:
     render_integrated_view(documents)
-with tab_more:
-    render_additional_views(documents)
-with tab_legacy:
-    render_legacy_views(documents, selected_topic_ids or topics["topic_id"].tolist())
 with tab_personalized:
     render_personalized_visualization(documents)
 with tab_evidence:
